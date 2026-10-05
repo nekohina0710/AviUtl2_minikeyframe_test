@@ -1,0 +1,99 @@
+--twopoint
+--param:ID,1
+--information:MiniKeyframe v0.1 (パラメータごとに独立したキーフレーム)
+
+-- 使い方：移動方法を「キーフレーム」にして、「設定」のIDに keyframes.lua の番号を入れる。
+-- 中間点は使わない。値と時間は keyframes.lua 側で決める。
+
+local DATA_NAMES = { "MiniKeyframe\\keyframes.lua", "keyframes.lua" }
+local RELOAD_SEC = 1.0
+
+local function load_table(path)
+  local chunk
+  if loadfile then chunk = loadfile(path) end
+  if not chunk and dofile then
+    local ok, t = pcall(dofile, path)
+    if ok and type(t) == "table" then return t end
+  end
+  if not chunk and io and io.open then
+    local f = io.open(path, "rb")
+    if f then
+      local src = f:read("*a"); f:close()
+      local compile = loadstring or load
+      chunk = compile(src, "keyframes")
+    end
+  end
+  if chunk then
+    local ok, t = pcall(chunk)
+    if ok and type(t) == "table" then return t end
+  end
+  return nil
+end
+
+local function get_data()
+  local now = 0
+  pcall(function() now = obj.getinfo("clock") or 0 end)
+  local c = rawget(_G, "__minikf")
+  if c and c.data and (now - c.at) < RELOAD_SEC and now >= c.at then return c.data end
+
+  local base = obj.getinfo("script_path") or ""
+  if base ~= "" and not base:match("[\\/]$") then base = base .. "\\" end
+  local data
+  for _, name in ipairs(DATA_NAMES) do
+    data = load_table(base .. name)
+    if data then break end
+  end
+  pcall(function() rawset(_G, "__minikf", { data = data or {}, at = now }) end)
+  return data or {}
+end
+
+---------------------------------------------------------------- 補間
+-- CSS の cubic-bezier(x1,y1,x2,y2) と同じ。x(時間の割合) から y(進み具合) を返す。
+local function bezier(x, x1, y1, x2, y2)
+  if x <= 0 then return 0 end
+  if x >= 1 then return 1 end
+  local function bx(u) local v = 1 - u; return 3*v*v*u*x1 + 3*v*u*u*x2 + u*u*u end
+  local function by(u) local v = 1 - u; return 3*v*v*u*y1 + 3*v*u*u*y2 + u*u*u end
+  local lo, hi, u = 0, 1, x
+  for _ = 1, 30 do                       -- 二分法（x1,x2 が 0〜1 なら x(u) は単調）
+    u = (lo + hi) / 2
+    if bx(u) < x then lo = u else hi = u end
+  end
+  return by(u)
+end
+
+local function ease(key, r)
+  local e = key.ease
+  if e == nil or e == "linear" then return r end
+  if e == "hold" then return 0 end
+  if type(e) == "table" then return bezier(r, e[1], e[2], e[3], e[4]) end
+  return r
+end
+
+local function evaluate(keys, t)
+  local n = #keys
+  if n == 0 then return nil end
+  if t <= keys[1].t then return keys[1].v end
+  if t >= keys[n].t then return keys[n].v end
+  for i = 1, n - 1 do
+    local a, b = keys[i], keys[i + 1]
+    if t < b.t then
+      local span = b.t - a.t
+      if span <= 0 then return b.v end
+      return a.v + (b.v - a.v) * ease(a, (t - a.t) / span)
+    end
+  end
+  return keys[n].v
+end
+
+---------------------------------------------------------------- 本体
+local id = obj.getpoint("param")
+local t  = obj.getpoint("time")
+local keys = get_data()[id]
+
+local v = keys and evaluate(keys, t)
+if v ~= nil then return v end
+
+-- データが無いIDは、普通の直線移動にする（中間点無視なので index は 0〜1）
+local st, ed = obj.getpoint(0), obj.getpoint(1)
+return st + (ed - st) * obj.getpoint("index")

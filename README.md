@@ -1,1 +1,2 @@
 # AviUtl2_minikeyframe_test
+プログラミングの練習、好きに使ってどうぞ

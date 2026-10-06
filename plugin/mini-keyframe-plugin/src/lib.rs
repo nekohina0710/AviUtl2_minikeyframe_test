@@ -1,4 +1,5 @@
 use aviutl2::AnyResult;
+use mini_keyframe_core::{Doc, Selection, Store};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -9,6 +10,19 @@ pub(crate) static EDIT_HANDLE: aviutl2::generic::GlobalEditHandle =
 
 /// 再生側スクリプトが読む keyframes.lua の場所（register時に決まる）。
 pub(crate) static LUA_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// プロジェクトファイルに保存するときのキー。
+const PROJECT_KEY: &str = "mini_keyframe_doc";
+
+/// keyframes.lua の場所。AviUtl2のデータフォルダ内（設定の準備ができてから呼ぶこと）。
+pub(crate) fn lua_path() -> &'static PathBuf {
+    LUA_PATH.get_or_init(|| {
+        aviutl2::config::app_data_path()
+            .join("Script")
+            .join("MiniKeyframe")
+            .join("keyframes.lua")
+    })
+}
 
 #[aviutl2::plugin(GenericPlugin)]
 pub struct MiniKeyframeTimelinePlugin {
@@ -37,12 +51,7 @@ impl aviutl2::generic::GenericPlugin for MiniKeyframeTimelinePlugin {
 
     fn register(&mut self, registry: &mut aviutl2::generic::HostAppHandle) {
         EDIT_HANDLE.init(registry.create_edit_handle());
-        let lua = aviutl2::config::app_data_path()
-            .join("Script")
-            .join("MiniKeyframe")
-            .join("keyframes.lua");
-        tracing::info!("keyframes.lua の出力先: {lua:?}");
-        let _ = LUA_PATH.set(lua);
+        tracing::info!("keyframes.lua の出力先: {:?}", lua_path());
         match self.window.handle() {
             Ok(handle) => match registry.register_window_client("MiniKeyframe タイムライン", &handle)
             {
@@ -50,6 +59,36 @@ impl aviutl2::generic::GenericPlugin for MiniKeyframeTimelinePlugin {
                 Err(e) => tracing::error!("パネルの登録に失敗しました: {e:?}"),
             },
             Err(e) => tracing::error!("パネルの初期化に失敗しました: {e:?}"),
+        }
+    }
+
+    /// プロジェクトを開いたとき（新規作成時も呼ばれる）：保存されたキーフレームを復元する。
+    fn on_project_load(&mut self, project: &mut aviutl2::generic::ProjectFile) {
+        let doc = match project.deserialize::<Doc>(PROJECT_KEY) {
+            Ok(doc) => {
+                tracing::info!("プロジェクトからキーフレームを読み込みました（{} 個のID）", doc.tracks.len());
+                doc
+            }
+            Err(e) => {
+                tracing::info!("プロジェクトにキーフレームのデータがないため、初期状態にします: {e}");
+                mini_keyframe_core::default_doc()
+            }
+        };
+        // 共有ファイルを書き換える。各パネルは、次の確認のときに読み直す。
+        let mut store = Store::open();
+        store.state.doc = doc;
+        store.state.sel = Selection::default();
+        store.clear_history();
+        if let Err(e) = store.save(Some(lua_path().as_path())) {
+            tracing::error!("キーフレームの反映に失敗しました: {e}");
+        }
+    }
+
+    /// プロジェクトを保存する直前：共有ファイルの最新の内容を、プロジェクトに入れる。
+    fn on_project_save(&mut self, project: &mut aviutl2::generic::ProjectFile) {
+        let store = Store::open();
+        if let Err(e) = project.serialize(PROJECT_KEY, &store.state.doc) {
+            tracing::error!("プロジェクトへのキーフレームの保存に失敗しました: {e}");
         }
     }
 }
@@ -99,6 +138,30 @@ pub(crate) fn scene_fps() -> Option<f64> {
     }
     let fps = EDIT_HANDLE.get_edit_info().fps;
     Some(*fps.numer() as f64 / *fps.denom() as f64)
+}
+
+/// 現在のカーソル（再生位置）のフレームと、シーンのfps。
+pub(crate) fn cursor_frame() -> Option<(usize, f64)> {
+    if !EDIT_HANDLE.is_ready() {
+        return None;
+    }
+    let info = EDIT_HANDLE.get_edit_info();
+    let fps = *info.fps.numer() as f64 / *info.fps.denom() as f64;
+    Some((info.frame, fps))
+}
+
+/// 選択中のオブジェクトの開始フレーム。
+pub(crate) fn focused_object_start() -> Option<usize> {
+    if !EDIT_HANDLE.is_ready() {
+        return None;
+    }
+    EDIT_HANDLE
+        .call_read_section(|section| -> Option<usize> {
+            let object = section.get_focused_object().ok().flatten()?;
+            section.get_object_layer_frame(object).ok().map(|lf| lf.start)
+        })
+        .ok()
+        .flatten()
 }
 
 aviutl2::register_generic_plugin!(MiniKeyframeTimelinePlugin);

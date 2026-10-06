@@ -1,5 +1,5 @@
 [package]
-name = "mini-keyframe-plugin"
+name = "mini-keyframe-easing-plugin"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,12 +8,12 @@ repository.workspace = true
 publish = false
 
 [lib]
-name = "mini_keyframe"
+name = "mini_keyframe_easing"
 crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1.0.104"
-aviutl2 = { workspace = true, features = ["serde"] }
+aviutl2.workspace = true
 aviutl2-eframe.workspace = true
 mini-keyframe-core = { path = "../mini-keyframe-core" }
 tracing = "0.1.44"

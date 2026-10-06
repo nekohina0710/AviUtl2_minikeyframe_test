@@ -1,7 +1,7 @@
 use aviutl2_eframe::{eframe, egui};
 use egui::{pos2, Align2, Color32, FontId, Pos2, Rect, Shape, Stroke};
-use mini_keyframe_core::{eval_keys, Ease, Key, Selection, Store};
-use std::time::Duration;
+use mini_keyframe_core::{eval_keys, Doc, Ease, Key, Selection, Store};
+use std::time::{Duration, Instant};
 
 const LM: f32 = 60.0; // 左のラベル欄の幅
 const RM: f32 = 14.0;
@@ -32,6 +32,21 @@ enum Hit {
     None,
 }
 
+/// Ctrl+Z → Some(true)（元に戻す）、Ctrl+Shift+Z / Ctrl+Y → Some(false)（やり直し）
+fn undo_shortcut(ui: &egui::Ui) -> Option<bool> {
+    ui.input_mut(|i| {
+        if i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z)
+            || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+        {
+            Some(false)
+        } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z) {
+            Some(true)
+        } else {
+            None
+        }
+    })
+}
+
 fn nice_step(range: f64, n: f64) -> f64 {
     let raw = range / n;
     let p = 10f64.powf(raw.log10().floor());
@@ -57,6 +72,13 @@ pub(crate) struct TimelineApp {
     snap: bool,
     fps: Option<f64>,
     drag: Option<(u32, usize)>,
+    drag_before: Option<Doc>,
+    /// 再生位置（選択オブジェクトの先頭からの秒数）
+    playhead: Option<f64>,
+    obj_start: Option<usize>,
+    obj_checked: Instant,
+    last_frame: Option<usize>,
+    fast_until: Instant,
     dirty: bool,
     msg: String,
 }
@@ -76,6 +98,12 @@ impl TimelineApp {
             snap: true,
             fps: None,
             drag: None,
+            drag_before: None,
+            playhead: None,
+            obj_start: None,
+            obj_checked: Instant::now(),
+            last_frame: None,
+            fast_until: Instant::now(),
             dirty: false,
             msg: String::new(),
         }
@@ -86,6 +114,15 @@ impl TimelineApp {
         match self.store.save(lua) {
             Ok(()) => self.msg.clear(),
             Err(e) => self.msg = format!("保存に失敗: {e}"),
+        }
+    }
+
+    fn history(&mut self, undo: bool) {
+        let ok = if undo { self.store.undo() } else { self.store.redo() };
+        if ok {
+            self.drag = None;
+            self.drag_before = None;
+            self.save();
         }
     }
 
@@ -133,7 +170,23 @@ impl TimelineApp {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(!self.store.state.undo.is_empty(), egui::Button::new("↶"))
+                    .on_hover_text("元に戻す (Ctrl+Z)")
+                    .clicked()
+                {
+                    self.history(true);
+                }
+                if ui
+                    .add_enabled(!self.store.state.redo.is_empty(), egui::Button::new("↷"))
+                    .on_hover_text("やり直し (Ctrl+Y)")
+                    .clicked()
+                {
+                    self.history(false);
+                }
+                ui.separator();
                 if ui.button("＋ID").clicked() {
+                    let before = self.store.state.doc.clone();
                     let id = self.store.state.doc.next_id();
                     self.store.state.doc.tracks.insert(
                         id,
@@ -142,12 +195,15 @@ impl TimelineApp {
                             Key { t: 1.0, v: 100.0, ease: Ease::Linear },
                         ],
                     );
+                    self.store.record(before, "");
                     self.select(id, None);
                 }
                 if ui.button("選択中のIDを削除").clicked() {
                     if let Some(id) = self.store.state.sel.id {
                         if self.store.state.doc.tracks.len() > 1 {
+                            let before = self.store.state.doc.clone();
                             self.store.state.doc.tracks.remove(&id);
+                            self.store.record(before, "");
                             self.store.state.sel = Selection::default();
                             self.save();
                         }
@@ -267,6 +323,7 @@ impl TimelineApp {
                 match self.hit(&ids, rect, view, p) {
                     Hit::Key(id, j) => {
                         self.select(id, Some(j));
+                        self.drag_before = Some(self.store.state.doc.clone());
                         self.drag = Some((id, j));
                     }
                     Hit::Seg(id, j) => self.select(id, Some(j)),
@@ -279,18 +336,27 @@ impl TimelineApp {
             if down {
                 if let Some(p) = ptr {
                     let t = self.snap_t(view.t(p.x));
+                    let mut moved_before: Option<Doc> = None;
                     if let Some(keys) = self.store.state.doc.tracks.get_mut(&id) {
                         let lo = if j > 0 { keys[j - 1].t + 0.001 } else { 0.0 };
                         let hi = if j + 1 < keys.len() { keys[j + 1].t - 0.001 } else { f64::INFINITY };
                         if lo <= hi && j < keys.len() {
-                            keys[j].t = t.clamp(lo, hi);
-                            self.dirty = true;
+                            let nt = t.clamp(lo, hi);
+                            if (keys[j].t - nt).abs() > 1e-9 {
+                                moved_before = self.drag_before.take();
+                                keys[j].t = nt;
+                                self.dirty = true;
+                            }
                         }
+                    }
+                    if let Some(b) = moved_before {
+                        self.store.record(b, "");
                     }
                 }
             }
             if released || !down {
                 self.drag = None;
+                self.drag_before = None;
                 if self.dirty {
                     self.dirty = false;
                     self.save();
@@ -301,16 +367,23 @@ impl TimelineApp {
             if let Some(p) = ptr {
                 match self.hit(&ids, rect, view, p) {
                     Hit::Key(id, j) => {
+                        let before = self.store.state.doc.clone();
+                        let mut removed = false;
                         if let Some(keys) = self.store.state.doc.tracks.get_mut(&id) {
                             if keys.len() > 1 {
                                 keys.remove(j);
+                                removed = true;
                             }
+                        }
+                        if removed {
+                            self.store.record(before, "");
                         }
                         self.store.state.sel = Selection { id: Some(id), key: None };
                         self.save();
                     }
                     Hit::Seg(id, _) | Hit::Row(id) if p.x >= view.l => {
                         let t = self.snap_t(view.t(p.x));
+                        let before = self.store.state.doc.clone();
                         let mut new_index = None;
                         if let Some(keys) = self.store.state.doc.tracks.get_mut(&id) {
                             if !keys.iter().any(|k| (k.t - t).abs() < 1e-6) {
@@ -321,6 +394,7 @@ impl TimelineApp {
                             }
                         }
                         if let Some(pos) = new_index {
+                            self.store.record(before, "");
                             self.select(id, Some(pos));
                         }
                     }
@@ -439,13 +513,47 @@ impl TimelineApp {
                 ));
             }
         }
+        // 再生位置の縦線
+        if let Some(ph) = self.playhead {
+            let x = view.x(ph);
+            if x >= view.l && x <= view.l + view.w {
+                let red = Color32::from_rgb(235, 80, 80);
+                painter.line_segment(
+                    [pos2(x, rect.top() + TOP - 4.0), pos2(x, rect.bottom())],
+                    Stroke::new(2.0, red),
+                );
+                painter.text(
+                    pos2(x + 4.0, rect.top() + TOP - 4.0),
+                    Align2::LEFT_BOTTOM,
+                    format!("{:.2}s", ph),
+                    FontId::proportional(10.0),
+                    red,
+                );
+            }
+        }
     }
 }
 
 impl eframe::App for TimelineApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // イージングパネル側の変更を拾うため、定期的に再描画してファイルを確認する
-        ui.ctx().request_repaint_after(Duration::from_millis(250));
+        // 再生位置を取得する（フレームが動いている間は、細かく再描画する）
+        if let Some((frame, fps)) = crate::cursor_frame() {
+            if self.last_frame != Some(frame) {
+                self.last_frame = Some(frame);
+                self.fast_until = Instant::now() + Duration::from_millis(500);
+            }
+            if self.obj_checked.elapsed() > Duration::from_millis(300) {
+                self.obj_start = crate::focused_object_start();
+                self.obj_checked = Instant::now();
+            }
+            self.playhead = self.obj_start.map(|s| (frame as f64 - s as f64) / fps);
+        }
+        let wait = if Instant::now() < self.fast_until { 33 } else { 200 };
+        ui.ctx().request_repaint_after(Duration::from_millis(wait));
+        if let Some(is_undo) = undo_shortcut(ui) {
+            self.history(is_undo);
+        }
         if self.fps.is_none() {
             self.fps = crate::scene_fps();
         }
